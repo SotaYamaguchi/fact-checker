@@ -4,7 +4,9 @@ import type { BaseTwitterProvider } from "./types";
 
 export function createTwitterProvider(): BaseTwitterProvider {
   const env = process.env.ENV || "local";
-  const provider = ["prod", "dev"].includes(env) ? "twitter" : "local";
+  // for test
+  // const provider = ["prod", "dev"].includes(env) ? "twitter" : "local";
+  const provider = ["prod"].includes(env) ? "twitter" : "local";
 
   switch (provider) {
     case "twitter":
