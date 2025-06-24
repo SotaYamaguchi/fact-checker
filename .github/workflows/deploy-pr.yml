@@ -1,0 +1,132 @@
+name: Deploy PR Environment
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, closed]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write  # PR にコメントするため
+
+env:
+  REGION: asia-northeast1
+  BASE_SERVICE: x-fact-checker
+
+jobs:
+  deploy:
+    if: contains(github.event.label.name, 'deploy-dev') || (github.event.action == 'labeled' && contains(github.event.label.name, 'deploy-dev'))
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        project_id: ${{ secrets.PROJECT_ID }}
+
+    - uses: google-github-actions/setup-gcloud@v2
+
+    - name: Set environment variables
+      run: |
+        echo "SERVICE_NAME=${BASE_SERVICE}-pr-${{ github.event.number }}" >> $GITHUB_ENV
+        echo "IMAGE_TAG=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
+
+    - name: Build and Deploy PR Environment
+      run: |
+        IMAGE="$REGION-docker.pkg.dev/${{ secrets.PROJECT_ID }}/$SERVICE_NAME/app:$IMAGE_TAG"
+        
+        # ビルド
+        gcloud builds submit --tag "$IMAGE" --quiet
+        
+        # デプロイ
+        gcloud run deploy "$SERVICE_NAME" \
+          --image "$IMAGE" \
+          --region "$REGION" \
+          --allow-unauthenticated \
+          --set-env-vars="ENV=dev,PR_NUMBER=${{ github.event.number }}" \
+          --update-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,\
+            X_BEARER_TOKEN=X_BEARER_TOKEN:latest,\
+            VECTOR_STORE_ID=VECTOR_STORE_ID:latest,\
+            SLACK_BOT_TOKEN=SLACK_BOT_TOKEN:latest,\
+            SLACK_SIGNING_SECRET=SLACK_SIGNING_SECRET:latest,\
+            SLACK_CHANNEL_ID=SLACK_CHANNEL_ID:latest,\
+            X_APP_KEY=X_APP_KEY:latest,\
+            X_APP_SECRET=X_APP_SECRET:latest,\
+            X_ACCESS_TOKEN=X_ACCESS_TOKEN:latest,\
+            X_ACCESS_SECRET=X_ACCESS_SECRET:latest,\
+            CRON_SECRET=CRON_SECRET:latest" \
+          --cpu=1 \
+          --memory=512Mi \
+          --min-instances=0 \
+          --max-instances=2
+
+    - name: Get service URL
+      id: get-url
+      run: |
+        URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format="value(status.url)")
+        echo "service_url=$URL" >> $GITHUB_OUTPUT
+
+    - name: Comment PR with deployment info
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🚀 **PR開発環境がデプロイされました！**
+            
+            **サービス名**: \`${{ env.SERVICE_NAME }}\`
+            **URL**: ${{ steps.get-url.outputs.service_url }}
+            **リージョン**: ${{ env.REGION }}
+            **イメージタグ**: \`${{ env.IMAGE_TAG }}\`
+            
+            環境変数 \`ENV=dev\` で開発環境として動作します。
+            
+            > ℹ️ このPRがクローズされると、環境は自動的に削除されます。`
+          });
+
+  cleanup:
+    if: github.event.action == 'closed' || (github.event.action == 'unlabeled' && contains(github.event.label.name, 'deploy-dev'))
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        project_id: ${{ secrets.PROJECT_ID }}
+
+    - uses: google-github-actions/setup-gcloud@v2
+
+    - name: Set environment variables
+      run: |
+        echo "SERVICE_NAME=${BASE_SERVICE}-pr-${{ github.event.number }}" >> $GITHUB_ENV
+
+    - name: Delete PR Environment
+      run: |
+        # サービスが存在するかチェック
+        if gcloud run services describe "$SERVICE_NAME" --region="$REGION" --quiet 2>/dev/null; then
+          echo "Deleting service: $SERVICE_NAME"
+          gcloud run services delete "$SERVICE_NAME" --region="$REGION" --quiet
+          echo "✅ Service deleted successfully"
+        else
+          echo "⚠️ Service $SERVICE_NAME not found (already deleted or never existed)"
+        fi
+
+    - name: Comment PR with cleanup info
+      if: github.event.action == 'closed'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `🧹 **PR開発環境がクリーンアップされました**
+            
+            サービス \`${{ env.SERVICE_NAME }}\` を削除しました。
+            
+            > ℹ️ 本番環境は影響を受けません。`
+          });
