@@ -21,6 +21,15 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Debug secrets
+      run: |
+        echo "Secret length: ${#GCLOUD_SERVICE_KEY}"
+        echo "Secret starts with: ${GCLOUD_SERVICE_KEY:0:20}..."
+        echo "Project ID: $PROJECT_ID"
+      env:
+        GCLOUD_SERVICE_KEY: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        PROJECT_ID: ${{ secrets.PROJECT_ID }}
+
     - uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
