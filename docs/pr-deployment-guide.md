@@ -24,8 +24,7 @@ GitHub Actionsの「Cleanup PR Environment」ワークフローから手動実�
 1. [Actions](https://github.com/SotaYamaguchi/fact-checker/actions) → 「Cleanup PR Environment」
 2. 「Run workflow」→ PR番号を入力して実行
 
-#### 定期クリーンアップ
-毎日午前2時（JST）に7日以上古い環境を自動削除します（デフォルト設定）
+
 
 ## 🏗️ 動作の仕組み
 
@@ -106,9 +105,9 @@ SlackやTeamsに通知を送ることも可能：
     text: "PR #${{ github.event.number }} deployed to ${{ steps.get-url.outputs.service_url }}"
 ```
 
-## �️ ワークフロー構成
+## 🗂️ ワークフロー構成
 
-このシステムは3つのワークフローで構成されています：
+このシステムは2つのワークフローで構成されています：
 
 ### 1. `deploy-pr.yml` - デプロイメント
 - **トリガー**: PRラベル追加（`deploy-dev`）
@@ -118,11 +117,7 @@ SlackやTeamsに通知を送ることも可能：
 - **トリガー**: PRクローズ、ラベル削除、手動実行
 - **機能**: 指定したPR環境の削除、詳細なログ出力
 
-### 3. `scheduled-cleanup.yml` - 定期クリーンアップ
-- **トリガー**: 毎日午前2時（JST）、手動実行
-- **機能**: 古い環境の自動削除、レポート作成
-
-## �🚨 トラブルシューティング
+## 🚨 トラブルシューティング
 
 ### よくある問題
 
@@ -139,9 +134,7 @@ SlackやTeamsに通知を送ることも可能：
    - 手動実行でPR番号が正しいか確認
    - GCPの権限を確認
 
-4. **定期クリーンアップが動作しない**
-   - スケジュール設定を確認（UTC 17:00 = JST 02:00）
-   - `issues: write` 権限があることを確認
+
 
 ### ログの確認
 
@@ -195,22 +188,6 @@ PRごとに専用のデータベースを作成：
 - **最小インスタンス**: 0（使用時のみ起動）
 - **最大インスタンス**: 2（コスト制限）
 - **CPU/メモリ**: 開発用に最小限
-
-### 定期クリーンアップ
-
-既に設定済みですが、設定をカスタマイズ可能：
-
-```yaml
-# scheduled-cleanup.yml の設定例
-on:
-  schedule:
-    # 毎週日曜日の午前2時に実行
-    - cron: '0 17 * * 0'
-  workflow_dispatch:
-    inputs:
-      days_old:
-        default: 3  # 3日以上古い環境を削除
-```
 
 ### クリーンアップ通知のカスタマイズ
 
