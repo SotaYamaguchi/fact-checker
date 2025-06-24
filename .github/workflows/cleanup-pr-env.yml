@@ -122,29 +122,20 @@ jobs:
         gcloud run services delete "$SERVICE_NAME" --region="$REGION" --quiet
         echo "✅ サービス削除完了: $SERVICE_NAME"
 
-    - name: Clean up Artifact Registry images (optional)
-      if: steps.check-conditions.outputs.should_cleanup == 'true' && github.event.inputs.force_cleanup == 'true'
+    - name: Delete Artifact Registry repository
+      if: steps.check-conditions.outputs.should_cleanup == 'true'
       continue-on-error: true
       run: |
-        echo "🧹 関連するDockerイメージのクリーンアップを開始"
+        echo "🧹 Artifact Registryリポジトリのクリーンアップを開始"
         
-        # PR関連のイメージを検索して削除
-        REPOSITORY="$REGION-docker.pkg.dev/${{ secrets.PROJECT_ID }}/$SERVICE_NAME"
-        
+        # PR専用のリポジトリを完全削除
         if gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" --quiet 2>/dev/null; then
-          echo "リポジトリが見つかりました: $REPOSITORY"
-          
-          # 古いイメージを削除（最新5つを保持）
-          gcloud artifacts docker images list "$REPOSITORY" \
-            --sort-by="~CREATE_TIME" \
-            --limit=999 \
-            --format="value(IMAGE)" | \
-            tail -n +6 | \
-            xargs -r -I {} gcloud artifacts docker images delete {} --quiet
-            
-          echo "✅ 古いイメージの削除完了"
+          echo "リポジトリが見つかりました: $SERVICE_NAME"
+          echo "🗑️ リポジトリ削除を開始: $SERVICE_NAME"
+          gcloud artifacts repositories delete "$SERVICE_NAME" --location="$REGION" --quiet
+          echo "✅ リポジトリ削除完了: $SERVICE_NAME"
         else
-          echo "⚠️ リポジトリ $REPOSITORY は存在しません"
+          echo "⚠️ リポジトリ $SERVICE_NAME は存在しません"
         fi
 
     - name: Comment on PR (auto cleanup)
