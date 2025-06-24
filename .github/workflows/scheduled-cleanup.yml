@@ -1,0 +1,192 @@
+name: Scheduled Environment Cleanup
+
+on:
+  schedule:
+    # 毎日午前2時(JST)に実行 (UTC 17:00)
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+    inputs:
+      days_old:
+        description: '何日以上古いサービスを削除するか'
+        required: false
+        type: number
+        default: 7
+      dry_run:
+        description: 'ドライラン（実際には削除しない）'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+
+env:
+  REGION: asia-northeast1
+  BASE_SERVICE: x-fact-checker
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        project_id: ${{ secrets.PROJECT_ID }}
+
+    - uses: google-github-actions/setup-gcloud@v2
+
+    - name: Set cleanup parameters
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "DAYS_OLD=${{ github.event.inputs.days_old }}" >> $GITHUB_ENV
+          echo "DRY_RUN=${{ github.event.inputs.dry_run }}" >> $GITHUB_ENV
+        else
+          echo "DAYS_OLD=7" >> $GITHUB_ENV
+          echo "DRY_RUN=false" >> $GITHUB_ENV
+        fi
+
+    - name: Find PR services
+      id: find-services
+      run: |
+        echo "🔍 PR関連のCloud Runサービスを検索中..."
+        
+        # PR関連のサービスを検索
+        SERVICES=$(gcloud run services list \
+          --region="$REGION" \
+          --filter="metadata.name~^${BASE_SERVICE}-pr-[0-9]+$" \
+          --format="csv[no-heading](metadata.name,metadata.creationTimestamp)" \
+          2>/dev/null || echo "")
+        
+        if [ -z "$SERVICES" ]; then
+          echo "services_found=false" >> $GITHUB_OUTPUT
+          echo "⚠️ PR関連のサービスが見つかりませんでした"
+          exit 0
+        fi
+        
+        echo "services_found=true" >> $GITHUB_OUTPUT
+        echo "Found services:"
+        echo "$SERVICES"
+        
+        # 古いサービスをフィルタリング
+        CUTOFF_DATE=$(date -d "$DAYS_OLD days ago" -u +"%Y-%m-%dT%H:%M:%SZ")
+        echo "Cutoff date: $CUTOFF_DATE"
+        
+        OLD_SERVICES=""
+        while IFS=, read -r service_name creation_time; do
+          if [ "$creation_time" \< "$CUTOFF_DATE" ]; then
+            OLD_SERVICES="$OLD_SERVICES$service_name,$creation_time\n"
+          fi
+        done <<< "$SERVICES"
+        
+        if [ -z "$OLD_SERVICES" ]; then
+          echo "old_services_found=false" >> $GITHUB_OUTPUT
+          echo "✅ 削除対象の古いサービスはありませんでした"
+        else
+          echo "old_services_found=true" >> $GITHUB_OUTPUT
+          echo -e "$OLD_SERVICES" > /tmp/old_services.txt
+          echo "削除対象のサービス:"
+          cat /tmp/old_services.txt
+        fi
+
+    - name: Create cleanup summary
+      if: steps.find-services.outputs.old_services_found == 'true'
+      id: summary
+      run: |
+        echo "## 🧹 定期クリーンアップレポート" > /tmp/cleanup_report.md
+        echo "" >> /tmp/cleanup_report.md
+        echo "**実行日時**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> /tmp/cleanup_report.md
+        echo "**実行モード**: $( [ \"$DRY_RUN\" = \"true\" ] && echo \"ドライラン\" || echo \"実際の削除\" )" >> /tmp/cleanup_report.md
+        echo "**削除基準**: ${DAYS_OLD}日以上前に作成されたサービス" >> /tmp/cleanup_report.md
+        echo "" >> /tmp/cleanup_report.md
+        echo "### 削除対象サービス" >> /tmp/cleanup_report.md
+        echo "" >> /tmp/cleanup_report.md
+        echo "| サービス名 | 作成日時 | PR番号 |" >> /tmp/cleanup_report.md
+        echo "|-----------|----------|--------|" >> /tmp/cleanup_report.md
+        
+        while IFS=, read -r service_name creation_time; do
+          PR_NUMBER=$(echo "$service_name" | sed "s/${BASE_SERVICE}-pr-//")
+          echo "| \`$service_name\` | $creation_time | #$PR_NUMBER |" >> /tmp/cleanup_report.md
+        done < /tmp/old_services.txt
+        
+        echo "" >> /tmp/cleanup_report.md
+
+    - name: Delete old services
+      if: steps.find-services.outputs.old_services_found == 'true'
+      run: |
+        DELETED_COUNT=0
+        FAILED_COUNT=0
+        
+        while IFS=, read -r service_name creation_time; do
+          echo "🗑️ 処理中: $service_name (作成: $creation_time)"
+          
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "   [ドライラン] 削除対象として検出"
+            DELETED_COUNT=$((DELETED_COUNT + 1))
+          else
+            if gcloud run services delete "$service_name" --region="$REGION" --quiet 2>/dev/null; then
+              echo "   ✅ 削除完了"
+              DELETED_COUNT=$((DELETED_COUNT + 1))
+            else
+              echo "   ❌ 削除失敗"
+              FAILED_COUNT=$((FAILED_COUNT + 1))
+            fi
+          fi
+        done < /tmp/old_services.txt
+        
+        echo "DELETED_COUNT=$DELETED_COUNT" >> $GITHUB_ENV
+        echo "FAILED_COUNT=$FAILED_COUNT" >> $GITHUB_ENV
+        
+        echo "" >> /tmp/cleanup_report.md
+        echo "### 実行結果" >> /tmp/cleanup_report.md
+        echo "" >> /tmp/cleanup_report.md
+        echo "- **削除成功**: ${DELETED_COUNT}件" >> /tmp/cleanup_report.md
+        echo "- **削除失敗**: ${FAILED_COUNT}件" >> /tmp/cleanup_report.md
+        
+        if [ "$DRY_RUN" = "true" ]; then
+          echo "" >> /tmp/cleanup_report.md
+          echo "> ⚠️ **ドライランモード**: 実際のサービス削除は行われませんでした" >> /tmp/cleanup_report.md
+        fi
+
+    - name: Create GitHub issue for cleanup report
+      if: steps.find-services.outputs.old_services_found == 'true' && env.DRY_RUN == 'false'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          const reportContent = fs.readFileSync('/tmp/cleanup_report.md', 'utf8');
+          
+          const title = `🧹 定期クリーンアップレポート - ${new Date().toISOString().split('T')[0]}`;
+          
+          await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: reportContent,
+            labels: ['automation', 'cleanup']
+          });
+
+    - name: Output summary
+      if: always()
+      run: |
+        echo "## 定期クリーンアップサマリー" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **実行日時**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> $GITHUB_STEP_SUMMARY
+        echo "- **削除基準**: ${DAYS_OLD}日以上前" >> $GITHUB_STEP_SUMMARY
+        echo "- **ドライラン**: $DRY_RUN" >> $GITHUB_STEP_SUMMARY
+        echo "- **PR関連サービス検出**: ${{ steps.find-services.outputs.services_found }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **削除対象サービス**: ${{ steps.find-services.outputs.old_services_found }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.find-services.outputs.old_services_found }}" = "true" ]; then
+          echo "- **削除成功**: ${DELETED_COUNT:-0}件" >> $GITHUB_STEP_SUMMARY
+          echo "- **削除失敗**: ${FAILED_COUNT:-0}件" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ -f "/tmp/cleanup_report.md" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat /tmp/cleanup_report.md >> $GITHUB_STEP_SUMMARY
+        fi

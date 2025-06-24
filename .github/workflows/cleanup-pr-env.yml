@@ -1,0 +1,206 @@
+name: Cleanup PR Environment
+
+on:
+  pull_request:
+    types: [closed, unlabeled]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR番号を指定してクリーンアップ'
+        required: true
+        type: string
+      force_cleanup:
+        description: '強制削除フラグ'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+env:
+  REGION: asia-northeast1
+  BASE_SERVICE: x-fact-checker
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Set PR number
+      id: set-pr
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "pr_number=${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+          echo "is_manual=true" >> $GITHUB_OUTPUT
+        else
+          echo "pr_number=${{ github.event.number }}" >> $GITHUB_OUTPUT
+          echo "is_manual=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Check cleanup conditions
+      id: check-conditions
+      run: |
+        # 手動実行の場合は常に実行
+        if [ "${{ steps.set-pr.outputs.is_manual }}" = "true" ]; then
+          echo "should_cleanup=true" >> $GITHUB_OUTPUT
+          echo "reason=manual_trigger" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # PRクローズの場合
+        if [ "${{ github.event.action }}" = "closed" ]; then
+          echo "should_cleanup=true" >> $GITHUB_OUTPUT
+          echo "reason=pr_closed" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        
+        # ラベル削除の場合
+        if [ "${{ github.event.action }}" = "unlabeled" ]; then
+          if echo "${{ github.event.label.name }}" | grep -q "deploy-dev"; then
+            echo "should_cleanup=true" >> $GITHUB_OUTPUT
+            echo "reason=label_removed" >> $GITHUB_OUTPUT
+          else
+            echo "should_cleanup=false" >> $GITHUB_OUTPUT
+            echo "reason=irrelevant_label" >> $GITHUB_OUTPUT
+          fi
+          exit 0
+        fi
+        
+        echo "should_cleanup=false" >> $GITHUB_OUTPUT
+        echo "reason=no_conditions_met" >> $GITHUB_OUTPUT
+
+    - name: Skip if conditions not met
+      if: steps.check-conditions.outputs.should_cleanup == 'false'
+      run: |
+        echo "⚠️ クリーンアップ条件を満たしていません"
+        echo "理由: ${{ steps.check-conditions.outputs.reason }}"
+        echo "PR番号: ${{ steps.set-pr.outputs.pr_number }}"
+        exit 0
+
+    - uses: google-github-actions/auth@v2
+      if: steps.check-conditions.outputs.should_cleanup == 'true'
+      with:
+        credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
+        project_id: ${{ secrets.PROJECT_ID }}
+
+    - uses: google-github-actions/setup-gcloud@v2
+      if: steps.check-conditions.outputs.should_cleanup == 'true'
+
+    - name: Set service name
+      if: steps.check-conditions.outputs.should_cleanup == 'true'
+      run: |
+        echo "SERVICE_NAME=${BASE_SERVICE}-pr-${{ steps.set-pr.outputs.pr_number }}" >> $GITHUB_ENV
+
+    - name: Check if service exists
+      if: steps.check-conditions.outputs.should_cleanup == 'true'
+      id: check-service
+      run: |
+        if gcloud run services describe "$SERVICE_NAME" --region="$REGION" --quiet 2>/dev/null; then
+          echo "service_exists=true" >> $GITHUB_OUTPUT
+          echo "✅ サービス $SERVICE_NAME が見つかりました"
+        else
+          echo "service_exists=false" >> $GITHUB_OUTPUT
+          echo "⚠️ サービス $SERVICE_NAME は存在しません"
+        fi
+
+    - name: Get service details before deletion
+      if: steps.check-conditions.outputs.should_cleanup == 'true' && steps.check-service.outputs.service_exists == 'true'
+      id: service-details
+      run: |
+        URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format="value(status.url)" 2>/dev/null || echo "N/A")
+        CREATED=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format="value(metadata.creationTimestamp)" 2>/dev/null || echo "N/A")
+        echo "service_url=$URL" >> $GITHUB_OUTPUT
+        echo "created_at=$CREATED" >> $GITHUB_OUTPUT
+
+    - name: Delete Cloud Run service
+      if: steps.check-conditions.outputs.should_cleanup == 'true' && steps.check-service.outputs.service_exists == 'true'
+      run: |
+        echo "🗑️ サービス削除を開始: $SERVICE_NAME"
+        gcloud run services delete "$SERVICE_NAME" --region="$REGION" --quiet
+        echo "✅ サービス削除完了: $SERVICE_NAME"
+
+    - name: Clean up Artifact Registry images (optional)
+      if: steps.check-conditions.outputs.should_cleanup == 'true' && github.event.inputs.force_cleanup == 'true'
+      continue-on-error: true
+      run: |
+        echo "🧹 関連するDockerイメージのクリーンアップを開始"
+        
+        # PR関連のイメージを検索して削除
+        REPOSITORY="$REGION-docker.pkg.dev/${{ secrets.PROJECT_ID }}/$SERVICE_NAME"
+        
+        if gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" --quiet 2>/dev/null; then
+          echo "リポジトリが見つかりました: $REPOSITORY"
+          
+          # 古いイメージを削除（最新5つを保持）
+          gcloud artifacts docker images list "$REPOSITORY" \
+            --sort-by="~CREATE_TIME" \
+            --limit=999 \
+            --format="value(IMAGE)" | \
+            tail -n +6 | \
+            xargs -r -I {} gcloud artifacts docker images delete {} --quiet
+            
+          echo "✅ 古いイメージの削除完了"
+        else
+          echo "⚠️ リポジトリ $REPOSITORY は存在しません"
+        fi
+
+    - name: Comment on PR (auto cleanup)
+      if: steps.check-conditions.outputs.should_cleanup == 'true' && steps.check-conditions.outputs.reason != 'manual_trigger' && github.event_name != 'workflow_dispatch'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const serviceExists = '${{ steps.check-service.outputs.service_exists }}' === 'true';
+          const reason = '${{ steps.check-conditions.outputs.reason }}';
+          const serviceName = '${{ env.SERVICE_NAME }}';
+          const serviceUrl = '${{ steps.service-details.outputs.service_url }}';
+          const createdAt = '${{ steps.service-details.outputs.created_at }}';
+          
+          let body = `🧹 **PR開発環境クリーンアップ完了**\n\n`;
+          
+          if (serviceExists) {
+            body += `✅ サービス \`${serviceName}\` を削除しました。\n\n`;
+            body += `**削除されたサービス情報:**\n`;
+            body += `- URL: ${serviceUrl}\n`;
+            body += `- 作成日時: ${createdAt}\n`;
+            body += `- リージョン: ${{ env.REGION }}\n\n`;
+          } else {
+            body += `⚠️ サービス \`${serviceName}\` は既に削除済みまたは存在しませんでした。\n\n`;
+          }
+          
+          if (reason === 'pr_closed') {
+            body += `**クリーンアップ理由:** PRがクローズされました\n`;
+          } else if (reason === 'label_removed') {
+            body += `**クリーンアップ理由:** \`deploy-dev\` ラベルが削除されました\n`;
+          }
+          
+          body += `\n> ℹ️ 本番環境は影響を受けません。`;
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: body
+          });
+
+    - name: Summary output
+      if: always()
+      run: |
+        echo "## クリーンアップサマリー" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "- **PR番号**: ${{ steps.set-pr.outputs.pr_number }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **サービス名**: ${{ env.SERVICE_NAME || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **実行理由**: ${{ steps.check-conditions.outputs.reason }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **クリーンアップ実行**: ${{ steps.check-conditions.outputs.should_cleanup }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **サービス存在**: ${{ steps.check-service.outputs.service_exists || 'N/A' }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **手動実行**: ${{ steps.set-pr.outputs.is_manual }}" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ steps.check-conditions.outputs.should_cleanup }}" = "true" ]; then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ **クリーンアップが正常に完了しました**" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **クリーンアップ条件を満たしていませんでした**" >> $GITHUB_STEP_SUMMARY
+        fi
