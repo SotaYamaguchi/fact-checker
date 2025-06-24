@@ -59,6 +59,7 @@ jobs:
           --image "$IMAGE" \
           --region "$REGION" \
           --allow-unauthenticated \
+          --service-account="github-deployer@team-mirai-463005.iam.gserviceaccount.com" \
           --set-env-vars="ENV=dev,PR_NUMBER=${{ github.event.number }}" \
           --update-secrets="OPENAI_API_KEY=OPENAI_API_KEY:latest,\
             X_BEARER_TOKEN=X_BEARER_TOKEN:latest,\
