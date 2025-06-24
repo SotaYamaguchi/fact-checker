@@ -17,7 +17,8 @@ jobs:
   deploy:
     if: contains(github.event.label.name, 'deploy-dev') || (github.event.action == 'labeled' && contains(github.event.label.name, 'deploy-dev'))
     runs-on: ubuntu-latest
-    
+    environment: pipeline
+
     steps:
     - uses: actions/checkout@v4
 
