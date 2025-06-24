@@ -21,19 +21,35 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
-    - uses: google-github-actions/auth@v2
+    - name: Check if running on fork
+      id: fork-check
+      run: |
+        if [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+          echo "is_fork=true" >> $GITHUB_OUTPUT
+          echo "::warning::フォークからのPRのため、デプロイをスキップします"
+        else
+          echo "is_fork=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Authenticate to Google Cloud
+      if: steps.fork-check.outputs.is_fork == 'false'
+      uses: google-github-actions/auth@v2
       with:
         credentials_json: ${{ secrets.GCLOUD_SERVICE_KEY }}
         project_id: ${{ secrets.PROJECT_ID }}
 
-    - uses: google-github-actions/setup-gcloud@v2
+    - name: Setup gcloud
+      if: steps.fork-check.outputs.is_fork == 'false'
+      uses: google-github-actions/setup-gcloud@v2
 
     - name: Set environment variables
+      if: steps.fork-check.outputs.is_fork == 'false'
       run: |
         echo "SERVICE_NAME=${BASE_SERVICE}-pr-${{ github.event.number }}" >> $GITHUB_ENV
         echo "IMAGE_TAG=${{ github.event.pull_request.head.sha }}" >> $GITHUB_ENV
 
     - name: Create Artifact Registry repository if not exists
+      if: steps.fork-check.outputs.is_fork == 'false'
       run: |
         # リポジトリが存在するかチェック
         if ! gcloud artifacts repositories describe "$SERVICE_NAME" --location="$REGION" --quiet 2>/dev/null; then
@@ -47,6 +63,7 @@ jobs:
         fi
 
     - name: Build and Deploy PR Environment
+      if: steps.fork-check.outputs.is_fork == 'false'
       run: |
         IMAGE="$REGION-docker.pkg.dev/${{ secrets.PROJECT_ID }}/$SERVICE_NAME/app:$IMAGE_TAG"
         
@@ -77,12 +94,14 @@ jobs:
           --max-instances=2
 
     - name: Get service URL
+      if: steps.fork-check.outputs.is_fork == 'false'
       id: get-url
       run: |
         URL=$(gcloud run services describe "$SERVICE_NAME" --region="$REGION" --format="value(status.url)")
         echo "service_url=$URL" >> $GITHUB_OUTPUT
 
     - name: Comment PR with deployment info
+      if: steps.fork-check.outputs.is_fork == 'false'
       uses: actions/github-script@v7
       with:
         script: |
@@ -100,5 +119,26 @@ jobs:
             環境変数 \`ENV=dev\` で開発環境として動作します。
             
             > ℹ️ このPRがクローズされると、環境は自動的に削除されます。`
+          });
+
+    - name: Comment on fork PR
+      if: steps.fork-check.outputs.is_fork == 'true'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `⚠️ **フォークからのPRのため、開発環境のデプロイをスキップしました**
+            
+            フォークリポジトリからのPRでは、セキュリティ上の理由でシークレットにアクセスできないため、
+            Google Cloud への自動デプロイは実行されません。
+            
+            **対処法:**
+            1. メインリポジトリのメンテナーがこのPRをローカルでテストする
+            2. マージ後に本番環境で動作確認を行う
+            
+            > ℹ️ これはセキュリティ機能の正常な動作です。`
           });
 
