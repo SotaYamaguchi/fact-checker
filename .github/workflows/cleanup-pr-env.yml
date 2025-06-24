@@ -27,6 +27,7 @@ env:
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    environment: pipeline
     
     steps:
     - name: Set PR number
